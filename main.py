@@ -1,5 +1,6 @@
 import json, requests, re, os, time, random, ipaddress
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.exceptions import ReadTimeout, ConnectTimeout, ProxyError
 from preferences import prefs
 from logger import logger
 
@@ -37,9 +38,10 @@ def verify(proxy):
     }
     start_time = time.time()
     try:
-        response = requests.get(target_url, headers=headers, proxies=proxies, timeout=20)
+        response = requests.get(target_url, headers=headers, proxies=proxies, timeout=(10, 15))
         return proxy, response.ok, int((time.time() - start_time) * 1000)
-    except:
+    except Exception as e:
+        logger.warning(f"代理 {proxy} 校验失败: {type(e).__name__}")
         return proxy, False, -1
 
 def is_phone_number(username):
@@ -91,22 +93,34 @@ def load():
 
 def checkIn(user, pwd, ip):
     global hasE
-    req = requests.session()
-    req.headers.update(headers)
     proxies = {
         'http': f'http://{ip}',
         'https': f'http://{ip}'
     }
-    req.proxies = proxies
-    logger.info(f"{format_username(user)} 开始签到")
-    try:
-        url = 'https://bbs.binmt.cc/member.php?mod=logging&action=login&infloat=yes&handlekey=login&inajax=1&ajaxtarget=fwin_content_login'
-        resp = req.get(url, proxies=proxies, timeout=20)
-        resp.encoding = resp.apparent_encoding
-        if resp.ok:
+
+    for attempt in range(3):
+        req = requests.session()
+        req.headers.update(headers)
+        req.proxies = proxies
+        if attempt == 0:
+            logger.info(f"{format_username(user)} 开始签到")
+        else:
+            logger.info(f"{format_username(user)} 第{attempt+1}次重试 (代理 {ip})")
+        try:
+            url = 'https://bbs.binmt.cc/member.php?mod=logging&action=login&infloat=yes&handlekey=login&inajax=1&ajaxtarget=fwin_content_login'
+            resp = req.get(url, proxies=proxies, timeout=(10, 15))
+            resp.encoding = resp.apparent_encoding
+            if not resp.ok:
+                logger.warning(f"{format_username(user)} 登录页获取失败: HTTP {resp.status_code}")
+                continue
+
             content = resp.text
             _loginhash = loginhash(content)
             _formhash = formhash(content)
+            if not _loginhash:
+                logger.warning(f"{format_username(user)} 未取到 loginhash，原始返回片段: {content[:300]}")
+                continue
+
             url = f'https://bbs.binmt.cc/member.php?mod=logging&action=login&loginsubmit=yes&handlekey=login&loginhash={_loginhash}&inajax=1'
             data = {
                 'formhash': _formhash,
@@ -118,32 +132,71 @@ def checkIn(user, pwd, ip):
                 'answer': '',
                 'agreebbrule': ''
             }
-            resp = req.post(url, data=data, proxies=proxies, timeout=20)
+            resp = req.post(url, data=data, proxies=proxies, timeout=(10, 15))
             resp.encoding = resp.apparent_encoding
-            if resp.ok:
-                if '失败' in resp.text:
-                    del accounts_list[user]
-                    logger.warning(f"{format_username(user)}: 密码错误")
-                    hasE = True
-                    return
-                url = 'https://bbs.binmt.cc/k_misign-sign.html'
-                resp = req.get(url, proxies=proxies, timeout=20)
-                resp.encoding = resp.apparent_encoding
-                _formhash = formhash(resp.text)
-                code = resp.status_code
-                if resp.ok:
-                    url = f'https://bbs.binmt.cc/plugin.php?id=k_misign:sign&operation=qiandao&format=text&formhash={_formhash}'
-                    resp = req.get(url, proxies=proxies, timeout=20)
-                    resp.encoding = resp.apparent_encoding
-                    if '已签' in resp.text:
-                        del accounts_list[user]
-                        logger.info(CDATA(resp.text))
-                        prefs.put(user, prefs.getTime())
-                        return True
-                    logger.warning(CDATA(resp.text))
-    except Exception as e:
-        logger.warning(f"异常: {str(e)}")
-        IP_LIST[ip] = False
+            if not resp.ok:
+                logger.warning(f"{format_username(user)} 登录提交失败: HTTP {resp.status_code}")
+                continue
+
+            logger.info(f"[DEBUG] 登录返回: {resp.text[:300]}")
+
+            if '失败' in resp.text:
+                del accounts_list[user]
+                logger.warning(f"{format_username(user)}: 密码错误")
+                hasE = True
+                return False
+
+            # 登录态校验
+            url = 'https://bbs.binmt.cc/k_misign-sign.html'
+            resp = req.get(url, proxies=proxies, timeout=(10, 15))
+            resp.encoding = resp.apparent_encoding
+            if not resp.ok:
+                logger.warning(f"{format_username(user)} 签到页获取失败: HTTP {resp.status_code}")
+                continue
+
+            sign_page = resp.text
+            is_logged_in = ('logout' in sign_page.lower()) or ('退出' in sign_page) or (user in sign_page)
+            if not is_logged_in:
+                logger.warning(f"{format_username(user)} 登录态校验失败（疑似未登录），页面片段: {sign_page[:300]}")
+                continue
+
+            _formhash = formhash(sign_page)
+            if not _formhash:
+                logger.warning(f"{format_username(user)} 签到页未取到 formhash，页面片段: {sign_page[:300]}")
+                continue
+
+            url = f'https://bbs.binmt.cc/plugin.php?id=k_misign:sign&operation=qiandao&format=text&formhash={_formhash}'
+            resp = req.get(url, proxies=proxies, timeout=(10, 15))
+            resp.encoding = resp.apparent_encoding
+            if not resp.ok:
+                logger.warning(f"{format_username(user)} 签到接口失败: HTTP {resp.status_code}")
+                continue
+
+            logger.info(f"[DEBUG] 签到返回原文: {resp.text[:500]}")
+
+            if '已签' in resp.text:
+                del accounts_list[user]
+                logger.info(CDATA(resp.text))
+                prefs.put(user, prefs.getTime())
+                return True
+            else:
+                logger.warning(f"{format_username(user)} 签到未成功: {CDATA(resp.text) or resp.text[:200]}")
+                return False
+
+        except (ReadTimeout, ConnectTimeout) as e:
+            logger.warning(f"{format_username(user)} 第{attempt+1}次超时 ({type(e).__name__})，代理 {ip}")
+            time.sleep(2)
+            continue
+        except ProxyError as e:
+            logger.warning(f"代理 {ip} 不可用: {e}")
+            IP_LIST[ip] = False
+            return False
+        except Exception as e:
+            logger.warning(f"异常: {type(e).__name__}: {str(e)}")
+            return False
+
+    # 三次都超时，认为该代理不稳，暂不剔除（下次可能恢复）
+    logger.warning(f"代理 {ip} 连续超时 3 次，跳过该代理")
     return False
 
 def loginhash(data):
@@ -189,12 +242,15 @@ def start():
         keys = list(accounts_list.keys())
         total = len(keys)
         for i, username in enumerate(keys):
-            for proxy, status in IP_LIST.items():
+            if username not in accounts_list:
+                continue
+            for proxy, status in list(IP_LIST.items()):
                 if not status: continue
                 try:
-                    if checkIn(username, accounts_list[username], proxy): break
-                except:
-                    pass
+                    if checkIn(username, accounts_list[username], proxy):
+                        break
+                except Exception as e:
+                    logger.warning(f"checkIn 外层异常: {type(e).__name__}: {e}")
             if i < total - 1:
                 time.sleep(3)
 start()
